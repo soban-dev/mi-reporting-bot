@@ -502,7 +502,7 @@ def parse_report_csv(csv_text: str) -> list[dict]:
     site_idx = -1
     for i, h in enumerate(headers):
         hh = h.strip()
-        if hh == "site" or hh == "site name" or hh == "site_name":
+        if hh == "site" or hh == "site name" or hh == "site_name" or hh.endswith(".site_name") or hh.endswith("site_name"):
             site_idx = i
             break
 
@@ -681,7 +681,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
     now_iso = datetime.now(timezone.utc).isoformat()
     daily: dict[str, dict] = {}
     country: dict[str, dict] = {}
-    breakdown_rows: list[dict] = []
+    breakdown_rows: dict[tuple[str, str, str, str, str, str], dict] = {}
     unmatched = 0
     for r in rows:
         ad_unit = (r.get("ad_unit") or "").strip()
@@ -743,24 +743,26 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         c["impressions"] += impressions
         c["clicks"] += clicks
 
-        breakdown_rows.append({
-            "network_code": GAM_NETWORK_CODE,
-            "ad_unit_id": ad_unit_id,
-            "ad_unit_path": path,
-            "website_name": website_name,
-            "country_code": country_code,
-            "country_name": country_name,
-            "device_category": device_category,
-            "app_name": app,
-            "date": date,
-            "revenue": revenue,
-            "impressions": impressions,
-            "clicks": clicks,
-            "ctr": ctr,
-            "ecpm": ecpm,
-            "cpm": (revenue / impressions) * 1000 if impressions else 0,
-            "updated_at": now_iso,
-        })
+        bkey = (ad_unit_id, website_name, country_code, device_category, app, date)
+        b = breakdown_rows.get(bkey)
+        if b is None:
+            b = breakdown_rows[bkey] = {
+                "network_code": GAM_NETWORK_CODE,
+                "ad_unit_id": ad_unit_id,
+                "ad_unit_path": path,
+                "website_name": website_name,
+                "country_code": country_code,
+                "country_name": country_name,
+                "device_category": device_category,
+                "app_name": app,
+                "date": date,
+                "revenue": 0,
+                "impressions": 0,
+                "clicks": 0,
+            }
+        b["revenue"] += revenue
+        b["impressions"] += impressions
+        b["clicks"] += clicks
 
     if unmatched:
         log.info("%d report row(s) had no matching ad unit path — skipped", unmatched)
@@ -787,7 +789,9 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         c["updated_at"] = now_iso
         country_rows.append(c)
 
-    if not daily and not country_rows and not breakdown_rows:
+    breakdown_rows_list = list(breakdown_rows.values())
+
+    if not daily and not country_rows and not breakdown_rows_list:
         return 0
 
     client = _supabase_client()
@@ -806,8 +810,8 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         ).execute())
         total += len(resp.data) if resp.data else 0
 
-    for i in range(0, len(breakdown_rows), BATCH_SIZE):
-        batch = breakdown_rows[i:i + BATCH_SIZE]
+    for i in range(0, len(breakdown_rows_list), BATCH_SIZE):
+        batch = breakdown_rows_list[i:i + BATCH_SIZE]
         resp = write_with_retry(lambda: client.table("ad_unit_breakdown_daily_stats").upsert(
             batch, on_conflict="network_code,ad_unit_id,website_name,country_code,device_category,app_name,date"
         ).execute())
