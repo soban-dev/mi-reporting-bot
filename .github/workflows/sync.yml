@@ -1,0 +1,32 @@
+name: GAM Sync v1
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sync]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      OLD_SUPABASE_URL: ${{ secrets.OLD_SUPABASE_URL }}
+      OLD_SUPABASE_SERVICE_KEY: ${{ secrets.OLD_SUPABASE_SERVICE_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      GAM_CLIENT_EMAIL: ${{ secrets.GAM_CLIENT_EMAIL }}
+      GAM_PRIVATE_KEY: ${{ secrets.GAM_PRIVATE_KEY }}
+      GAM_NETWORK_CODE: ${{ secrets.GAM_NETWORK_CODE }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - run: python sync.py --once
