@@ -290,13 +290,14 @@ def build_report_query(start_date: str, end_date: str, ad_unit_ids: Optional[lis
     <runReportJob xmlns="https://www.google.com/apis/ads/publisher/{GAM_VERSION}">
       <reportJob>
         <reportQuery>
-          <dimensions>DATE</dimensions>
-          <dimensions>AD_UNIT</dimensions>
-          <dimensions>AD_UNIT_ID</dimensions>
-          <dimensions>COUNTRY</dimensions>
-          <dimensions>COUNTRY_CODE</dimensions>
-          <dimensions>DEVICE_CATEGORY_NAME</dimensions>
-          <dimensions>MOBILE_APP_NAME</dimensions>
+           <dimensions>DATE</dimensions>
+           <dimensions>AD_UNIT</dimensions>
+           <dimensions>AD_UNIT_ID</dimensions>
+           <dimensions>SITE_NAME</dimensions>
+           <dimensions>COUNTRY</dimensions>
+           <dimensions>COUNTRY_CODE</dimensions>
+           <dimensions>DEVICE_CATEGORY_NAME</dimensions>
+           <dimensions>MOBILE_APP_NAME</dimensions>
           <columns>AD_EXCHANGE_LINE_ITEM_LEVEL_REVENUE</columns>
           <columns>AD_EXCHANGE_LINE_ITEM_LEVEL_IMPRESSIONS</columns>
           <columns>AD_EXCHANGE_LINE_ITEM_LEVEL_CLICKS</columns>
@@ -498,6 +499,13 @@ def parse_report_csv(csv_text: str) -> list[dict]:
             app_idx = i
             break
 
+    site_idx = -1
+    for i, h in enumerate(headers):
+        hh = h.strip()
+        if hh == "site" or hh == "site name" or hh == "site_name":
+            site_idx = i
+            break
+
     if ad_unit_id_idx < 0:
         ad_unit_id_idx = ad_unit_idx
 
@@ -520,6 +528,7 @@ def parse_report_csv(csv_text: str) -> list[dict]:
             "date": cols[date_idx] if date_idx >= 0 else "",
             "ad_unit": cols[ad_unit_idx] if ad_unit_idx >= 0 else "",
             "ad_unit_id": cols[ad_unit_id_idx] if ad_unit_id_idx >= 0 else "",
+            "website_name": cols[site_idx] if site_idx >= 0 else "",
             "country_code": cols[country_code_idx] if country_code_idx >= 0 else "",
             "country": cols[country_name_idx] if country_name_idx >= 0 else "",
             "device_category": cols[device_category_idx] if device_category_idx >= 0 else "",
@@ -618,7 +627,7 @@ def build_path_lookup(websites: list[dict]) -> dict[str, dict]:
         for p in w["paths"]:
             if not p:
                 continue
-            entry = {"website": w["website"], "network_code": w["network_code"]}
+            entry = {"website": w["website"], "host": w["host"], "network_code": w["network_code"]}
             aliases = {p, p.strip("/"), w["host"]}
             last = p.rsplit("/", 1)[-1]
             if last:
@@ -661,8 +670,8 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
     """Map each report row to a website via its ad unit path and upsert the data.
 
     Because the report is run with the COUNTRY dimension, each (date, ad unit)
-    appears once per country. We:
-      * aggregate revenue/impressions/clicks back to (network, ad_unit, date)
+    appears once per country/site. We:
+      * aggregate revenue/impressions/clicks back to (network, website, ad_unit, date)
         and upsert into ad_unit_daily_stats (recomputing ctr/ecpm/cpm);
       * write each country row into ad_unit_country_daily_stats.
     Returns number of country rows written."""
@@ -690,6 +699,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         impressions = r.get("impressions") or 0
         clicks = r.get("clicks") or 0
         path = "/" + (key.lstrip("/"))
+        website_name = (r.get("website_name") or "").strip() or site["host"]
         device_category = (r.get("device_category") or "N/A").strip() or "N/A"
         app = (r.get("app") or "N/A").strip() or "N/A"
         country_code = r.get("country_code") or ""
@@ -697,14 +707,14 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         ctr = r.get("ctr") or 0
         ecpm = r.get("ecpm") or 0
 
-        dkey = (ad_unit_id, date)
+        dkey = (ad_unit_id, website_name, date)
         d = daily.get(dkey)
         if d is None:
             d = daily[dkey] = {
                 "network_code": GAM_NETWORK_CODE,
                 "ad_unit_id": ad_unit_id,
                 "ad_unit_path": path,
-                "website_name": site["website"],
+                "website_name": website_name,
                 "date": date,
                 "revenue": 0,
                 "impressions": 0,
@@ -714,14 +724,14 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         d["impressions"] += impressions
         d["clicks"] += clicks
 
-        ckey = (ad_unit_id, country_code, date)
+        ckey = (ad_unit_id, website_name, country_code, date)
         c = country.get(ckey)
         if c is None:
             c = country[ckey] = {
                 "network_code": GAM_NETWORK_CODE,
                 "ad_unit_id": ad_unit_id,
                 "ad_unit_path": path,
-                "website_name": site["website"],
+                "website_name": website_name,
                 "country_code": country_code,
                 "country_name": country_name,
                 "date": date,
@@ -737,7 +747,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
             "network_code": GAM_NETWORK_CODE,
             "ad_unit_id": ad_unit_id,
             "ad_unit_path": path,
-            "website_name": site["website"],
+            "website_name": website_name,
             "country_code": country_code,
             "country_name": country_name,
             "device_category": device_category,
@@ -785,21 +795,21 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
     for i in range(0, len(daily_rows), BATCH_SIZE):
         batch = daily_rows[i:i + BATCH_SIZE]
         resp = write_with_retry(lambda: client.table("ad_unit_daily_stats").upsert(
-            batch, on_conflict="network_code,ad_unit_id,date"
+            batch, on_conflict="network_code,ad_unit_id,website_name,date"
         ).execute())
         total += len(resp.data) if resp.data else 0
 
     for i in range(0, len(country_rows), BATCH_SIZE):
         batch = country_rows[i:i + BATCH_SIZE]
         resp = write_with_retry(lambda: client.table("ad_unit_country_daily_stats").upsert(
-            batch, on_conflict="network_code,ad_unit_id,country_code,date"
+            batch, on_conflict="network_code,ad_unit_id,website_name,country_code,date"
         ).execute())
         total += len(resp.data) if resp.data else 0
 
     for i in range(0, len(breakdown_rows), BATCH_SIZE):
         batch = breakdown_rows[i:i + BATCH_SIZE]
         resp = write_with_retry(lambda: client.table("ad_unit_breakdown_daily_stats").upsert(
-            batch, on_conflict="network_code,ad_unit_id,country_code,device_category,app_name,date"
+            batch, on_conflict="network_code,ad_unit_id,website_name,country_code,device_category,app_name,date"
         ).execute())
         total += len(resp.data) if resp.data else 0
 

@@ -7,7 +7,7 @@
 --  and server API routes) can read/write.
 -- ════════════════════════════════════════════════════════════════════
 
--- 1. ad_unit_daily_stats — one row per (network_code, ad_unit_id, date)
+-- 1. ad_unit_daily_stats — one row per (network_code, ad_unit_id, website_name, date)
 CREATE TABLE IF NOT EXISTS public.ad_unit_daily_stats (
   id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   network_code  TEXT NOT NULL,
@@ -24,15 +24,16 @@ CREATE TABLE IF NOT EXISTS public.ad_unit_daily_stats (
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_ad_unit_daily_code_id_date
-  ON public.ad_unit_daily_stats (network_code, ad_unit_id, date);
+DROP INDEX IF EXISTS public.ux_ad_unit_daily_code_id_date;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ad_unit_daily_code_id_website_date
+  ON public.ad_unit_daily_stats (network_code, ad_unit_id, website_name, date);
 CREATE INDEX IF NOT EXISTS idx_ad_unit_daily_date ON public.ad_unit_daily_stats(date DESC);
 CREATE INDEX IF NOT EXISTS idx_ad_unit_daily_website ON public.ad_unit_daily_stats(website_name);
 CREATE INDEX IF NOT EXISTS idx_ad_unit_daily_net_date ON public.ad_unit_daily_stats(network_code, date DESC);
 
 ALTER TABLE public.ad_unit_daily_stats ENABLE ROW LEVEL SECURITY;
 
--- 2. ad_unit_country_daily_stats — one row per (network_code, ad_unit_id, country, date)
+-- 2. ad_unit_country_daily_stats — one row per (network_code, ad_unit_id, website_name, country, date)
 CREATE TABLE IF NOT EXISTS public.ad_unit_country_daily_stats (
   id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   network_code  TEXT NOT NULL,
@@ -51,15 +52,16 @@ CREATE TABLE IF NOT EXISTS public.ad_unit_country_daily_stats (
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_ad_unit_country_code_id_country_date
-  ON public.ad_unit_country_daily_stats (network_code, ad_unit_id, country_code, date);
+DROP INDEX IF EXISTS public.ux_ad_unit_country_code_id_country_date;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ad_unit_country_code_id_website_country_date
+  ON public.ad_unit_country_daily_stats (network_code, ad_unit_id, website_name, country_code, date);
 CREATE INDEX IF NOT EXISTS idx_ad_unit_country_date ON public.ad_unit_country_daily_stats(date DESC);
 CREATE INDEX IF NOT EXISTS idx_ad_unit_country_website ON public.ad_unit_country_daily_stats(website_name);
 CREATE INDEX IF NOT EXISTS idx_ad_unit_country_code ON public.ad_unit_country_daily_stats(country_code);
 
 ALTER TABLE public.ad_unit_country_daily_stats ENABLE ROW LEVEL SECURITY;
 
--- 3. ad_unit_breakdown_daily_stats — one row per (network, ad_unit, country, device, app, date).
+-- 3. ad_unit_breakdown_daily_stats — one row per (network, ad_unit, website_name, country, device, app, date).
 --    Feeds the /dashboard/report filter page (eCPM / country / device / app / ad unit breakdowns).
 CREATE TABLE IF NOT EXISTS public.ad_unit_breakdown_daily_stats (
   id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -81,8 +83,9 @@ CREATE TABLE IF NOT EXISTS public.ad_unit_breakdown_daily_stats (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_breakdown_code_id_country_device_app_date
-  ON public.ad_unit_breakdown_daily_stats (network_code, ad_unit_id, country_code, device_category, app_name, date);
+DROP INDEX IF EXISTS public.ux_breakdown_code_id_country_device_app_date;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_breakdown_code_id_website_country_device_app_date
+  ON public.ad_unit_breakdown_daily_stats (network_code, ad_unit_id, website_name, country_code, device_category, app_name, date);
 CREATE INDEX IF NOT EXISTS idx_breakdown_date ON public.ad_unit_breakdown_daily_stats(date DESC);
 CREATE INDEX IF NOT EXISTS idx_breakdown_website ON public.ad_unit_breakdown_daily_stats(website_name);
 CREATE INDEX IF NOT EXISTS idx_breakdown_country ON public.ad_unit_breakdown_daily_stats(country_code);
