@@ -68,6 +68,13 @@ REPORT_DOWNLOAD_TIMEOUT = int(os.getenv("REPORT_DOWNLOAD_TIMEOUT", "300"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 GAM_VERSION = "v202602"
 
+
+def env_flag(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+RETENTION_CLEANUP_ENABLED = env_flag("RETENTION_CLEANUP_ENABLED", "true")
+
 # ── Logging Setup ───────────────────────────────────────────────
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -590,23 +597,52 @@ def fetch_websites() -> list[dict]:
     for r in rows:
         network_code = (r.get("adx_network_code") or "").strip()
         paths: list[str] = []
+        unit_ids: list[str] = []
+        unit_names: list[str] = []
         raw = r.get("ad_units")
-        if isinstance(raw, str) and raw.strip():
+        parsed_units = None
+        if isinstance(raw, list):
+            parsed_units = raw
+        elif isinstance(raw, str) and raw.strip():
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, list):
-                    paths = [
-                        normalize_path(u.get("ad_unit_path", ""))
-                        for u in parsed
-                        if isinstance(u, dict) and u.get("ad_unit_path")
-                    ]
+                    parsed_units = parsed
             except json.JSONDecodeError:
-                paths = []
+                parsed_units = None
+
+        if isinstance(parsed_units, list):
+            for u in parsed_units:
+                if not isinstance(u, dict):
+                    continue
+                p = normalize_path(
+                    str(
+                        u.get("ad_unit_path")
+                        or u.get("path")
+                        or ""
+                    )
+                )
+                if p:
+                    paths.append(p)
+                nm = normalize_path(str(u.get("ad_unit_name") or u.get("name") or ""))
+                if nm:
+                    unit_names.append(nm)
+                uid = str(u.get("ad_unit_id") or u.get("adUnitId") or u.get("id") or "").strip()
+                if uid:
+                    unit_ids.append(uid)
+
+        # keep unique, stable order
+        paths = list(dict.fromkeys(paths))
+        unit_names = list(dict.fromkeys(unit_names))
+        unit_ids = list(dict.fromkeys(unit_ids))
+
         websites.append({
             "website": (r.get("website") or "").strip(),
             "host": website_host(r.get("website") or ""),
             "network_code": network_code,
             "paths": paths,
+            "unit_names": unit_names,
+            "unit_ids": unit_ids,
         })
     return websites
 
@@ -624,18 +660,47 @@ def build_path_lookup(websites: list[dict]) -> dict[str, dict]:
     """
     lookup: dict[str, dict] = {}
     for w in websites:
+        entry = {"website": w["website"], "host": w["host"], "network_code": w["network_code"]}
+        if w.get("host"):
+            host = w["host"]
+            lookup.setdefault(host, entry)
+            lookup.setdefault(f"www.{host}", entry)
+
+        raw_site = normalize_path(w.get("website") or "")
+        if raw_site:
+            lookup.setdefault(raw_site, entry)
+            raw_host = website_host(raw_site)
+            if raw_host:
+                lookup.setdefault(raw_host, entry)
+                lookup.setdefault(f"www.{raw_host}", entry)
+
         for p in w["paths"]:
             if not p:
                 continue
-            entry = {"website": w["website"], "host": w["host"], "network_code": w["network_code"]}
             aliases = {p, p.strip("/"), w["host"]}
+            if w.get("host"):
+                aliases.add(f"www.{w['host']}")
             last = p.rsplit("/", 1)[-1]
             if last:
                 aliases.add(last)
             for a in aliases:
                 if a:
                     lookup.setdefault(a, entry)
+
+        for n in w.get("unit_names", []):
+            if n:
+                lookup.setdefault(n, entry)
     return lookup
+
+
+def group_websites_by_network_code(websites: list[dict], default_network_code: str) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for w in websites:
+        code = str(w.get("network_code") or "").strip() or default_network_code
+        if not code:
+            continue
+        grouped.setdefault(code, []).append(w)
+    return grouped
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -666,7 +731,12 @@ def get_gam_token_cached() -> str:
 # ═════════════════════════════════════════════════════════════════
 
 
-def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
+def upsert_report_rows(
+    rows: list[dict],
+    lookup: dict[str, dict],
+    id_lookup: Optional[dict[str, dict]] = None,
+    report_network_code: str = "",
+) -> int:
     """Map each report row to a website via its ad unit path and upsert the data.
 
     Because the report is run with the COUNTRY dimension, each (date, ad unit)
@@ -682,15 +752,32 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
     daily: dict[str, dict] = {}
     country: dict[str, dict] = {}
     breakdown_rows: dict[tuple[str, str, str, str, str, str], dict] = {}
+    host_lookup: dict[str, dict] = {}
+    for v in lookup.values():
+        h = (v.get("host") or "").strip()
+        if h and h not in host_lookup:
+            host_lookup[h] = v
     unmatched = 0
+    unmatched_samples: list[dict] = []
     for r in rows:
         ad_unit = (r.get("ad_unit") or "").strip()
         key = normalize_path(ad_unit)
         if not key:
             key = (r.get("ad_unit_id") or "").strip()
+        ad_unit_id = (r.get("ad_unit_id") or "").strip()
         site = lookup.get(key) or lookup.get(website_host(ad_unit))
         if not site:
+            site = host_lookup.get(website_host(r.get("website_name") or ""))
+        if not site and id_lookup and ad_unit_id:
+            site = id_lookup.get(ad_unit_id)
+        if not site:
             unmatched += 1
+            if len(unmatched_samples) < 5:
+                unmatched_samples.append({
+                    "ad_unit": ad_unit,
+                    "ad_unit_id": ad_unit_id,
+                    "website_name": (r.get("website_name") or "").strip(),
+                })
             continue
 
         ad_unit_id = r.get("ad_unit_id") or ""
@@ -699,7 +786,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         impressions = r.get("impressions") or 0
         clicks = r.get("clicks") or 0
         path = "/" + (key.lstrip("/"))
-        website_name = (r.get("website_name") or "").strip() or site["host"]
+        website_name = website_host((r.get("website_name") or "").strip()) or site["host"]
         device_category = (r.get("device_category") or "N/A").strip() or "N/A"
         app = (r.get("app") or "N/A").strip() or "N/A"
         country_code = r.get("country_code") or ""
@@ -711,7 +798,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         d = daily.get(dkey)
         if d is None:
             d = daily[dkey] = {
-                "network_code": GAM_NETWORK_CODE,
+                "network_code": report_network_code,
                 "ad_unit_id": ad_unit_id,
                 "ad_unit_path": path,
                 "website_name": website_name,
@@ -728,7 +815,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         c = country.get(ckey)
         if c is None:
             c = country[ckey] = {
-                "network_code": GAM_NETWORK_CODE,
+                "network_code": report_network_code,
                 "ad_unit_id": ad_unit_id,
                 "ad_unit_path": path,
                 "website_name": website_name,
@@ -747,7 +834,7 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         b = breakdown_rows.get(bkey)
         if b is None:
             b = breakdown_rows[bkey] = {
-                "network_code": GAM_NETWORK_CODE,
+                "network_code": report_network_code,
                 "ad_unit_id": ad_unit_id,
                 "ad_unit_path": path,
                 "website_name": website_name,
@@ -765,7 +852,9 @@ def upsert_report_rows(rows: list[dict], lookup: dict[str, dict]) -> int:
         b["clicks"] += clicks
 
     if unmatched:
-        log.info("%d report row(s) had no matching ad unit path — skipped", unmatched)
+        log.info("[%s] %d report row(s) had no matching ad unit path — skipped", report_network_code or "unknown", unmatched)
+        if unmatched_samples:
+            log.info("[%s] Unmatched sample rows: %s", report_network_code or "unknown", unmatched_samples)
 
     daily_rows = []
     for d in daily.values():
@@ -893,61 +982,124 @@ def run_sync_cycle() -> dict:
 
     # 1. Load website → ad unit path mapping from the OLD DB
     websites = fetch_websites()
-    lookup = build_path_lookup(websites)
-    log.info("Loaded %d websites with %d known ad unit path(s) from OLD DB", len(websites), len(lookup))
+    grouped = group_websites_by_network_code(websites, GAM_NETWORK_CODE)
+    total_lookup_keys = sum(len(build_path_lookup(gsites)) for gsites in grouped.values())
+    log.info(
+        "Loaded %d websites across %d network(s) with %d known ad unit key(s) from OLD DB",
+        len(websites),
+        len(grouped),
+        total_lookup_keys,
+    )
 
-    if not lookup:
+    if not grouped:
         return {"status": "skipped", "reason": "no ad unit paths", "elapsed": time.time() - start_time}
+    # 2. Per network: fetch inventory -> fetch report -> write rows.
+    total_inventory_units = 0
+    total_report_rows = 0
+    written = 0
+    network_errors = 0
 
-    # 2. Fetch the network's ad unit inventory, keep only the ones matching our sites,
-    #    and filter the report to just those (scales to thousands of units).
-    inventory = fetch_ad_units(GAM_NETWORK_CODE, token)
-    wanted_ids = []
-    for alias, site in lookup.items():
-        for uid in inventory.get(alias, []):
-            if uid not in wanted_ids:
-                wanted_ids.append(uid)
-    log.info("GAM inventory: %d ad unit name(s); keeping %d IDs matching our sites", len(inventory), len(wanted_ids))
+    for network_code, net_sites in grouped.items():
+        lookup = build_path_lookup(net_sites)
+        if not lookup:
+            log.warning("[%s] No lookup keys from approved websites, skipping network", network_code)
+            continue
 
-    if not wanted_ids:
-        log.warning("No known ad units found in inventory — falling back to full-network report")
+        try:
+            inventory = fetch_ad_units(network_code, token)
+            total_inventory_units += len(inventory)
 
-    # 3. Fetch + write the report (single network). If the ID filter is rejected,
-    #    fall back to an unfiltered report so the sync still completes.
-    try:
-        job_id = submit_report_job(GAM_NETWORK_CODE, start_date, end_date, token, wanted_ids or None)
-    except RuntimeError as e:
-        msg = str(e).lower()
-        if wanted_ids and any(k in msg for k in ("not a valid value", "statement", "query", "unexecutable")):
-            log.warning("Report ID filter rejected, retrying without filter: %s", e)
-            job_id = submit_report_job(GAM_NETWORK_CODE, start_date, end_date, token)
-        else:
-            raise
-    status = "IN_PROGRESS"
-    for _ in range(REPORT_POLL_MAX):
-        time.sleep(2)
-        status = get_report_job_status(GAM_NETWORK_CODE, job_id, token)
-        if status in ("COMPLETED", "FAILED"):
-            break
-    if status == "FAILED":
-        raise RuntimeError(f"Report job {job_id} failed")
-    if status != "COMPLETED":
-        raise RuntimeError(f"Report job {job_id} timed out")
+            wanted_ids = []
+            id_lookup: dict[str, dict] = {}
+            inventory_ids = set()
+            for ids in inventory.values():
+                for uid in ids:
+                    if uid:
+                        inventory_ids.add(uid)
 
-    rows = download_report_rows(GAM_NETWORK_CODE, job_id, token)
-    log.info("Fetched %d report row(s)", len(rows))
+            for w in net_sites:
+                entry = {"website": w["website"], "host": w["host"], "network_code": w["network_code"]}
+                for uid in w.get("unit_ids", []):
+                    if uid and uid in inventory_ids:
+                        if uid not in wanted_ids:
+                            wanted_ids.append(uid)
+                        if uid not in id_lookup:
+                            id_lookup[uid] = entry
 
-    written = upsert_report_rows(rows, lookup)
+            for alias, site in lookup.items():
+                for uid in inventory.get(alias, []):
+                    if uid not in wanted_ids:
+                        wanted_ids.append(uid)
+                    if uid and uid not in id_lookup:
+                        id_lookup[uid] = site
 
-    cutoff = get_date_days_ago(RETENTION_DAYS)
-    deleted = cleanup_old_data(cutoff)
+            log.info("[%s] GAM inventory: %d ad unit name(s); keeping %d IDs matching our sites", network_code, len(inventory), len(wanted_ids))
+            if not wanted_ids:
+                inv_keys = list(inventory.keys())[:10]
+                look_keys = list(lookup.keys())[:20]
+                log.info("[%s] Inventory key sample: %s", network_code, inv_keys)
+                log.info("[%s] Lookup key sample: %s", network_code, look_keys)
+                log.warning("[%s] No known ad units found in inventory — falling back to full-network report", network_code)
+
+            try:
+                job_id = submit_report_job(network_code, start_date, end_date, token, wanted_ids or None)
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if wanted_ids and any(k in msg for k in ("not a valid value", "statement", "query", "unexecutable")):
+                    log.warning("[%s] Report ID filter rejected, retrying without filter: %s", network_code, e)
+                    job_id = submit_report_job(network_code, start_date, end_date, token)
+                else:
+                    raise
+
+            status = "IN_PROGRESS"
+            for _ in range(REPORT_POLL_MAX):
+                time.sleep(2)
+                status = get_report_job_status(network_code, job_id, token)
+                if status in ("COMPLETED", "FAILED"):
+                    break
+            if status == "FAILED":
+                raise RuntimeError(f"Report job {job_id} failed")
+            if status != "COMPLETED":
+                raise RuntimeError(f"Report job {job_id} timed out")
+
+            rows = download_report_rows(network_code, job_id, token)
+            total_report_rows += len(rows)
+            log.info("[%s] Fetched %d report row(s)", network_code, len(rows))
+
+            website_hosts = {w.get("host", "") for w in net_sites if w.get("host")}
+            report_hosts = {
+                website_host(str(r.get("website_name") or ""))
+                for r in rows
+                if str(r.get("website_name") or "").strip()
+            }
+            if report_hosts and report_hosts.isdisjoint(website_hosts):
+                log.warning(
+                    "[%s] Report hosts do not match approved website hosts. report_hosts=%s approved_hosts=%s",
+                    network_code,
+                    sorted(report_hosts),
+                    sorted(website_hosts),
+                )
+
+            written += upsert_report_rows(rows, lookup, id_lookup, network_code)
+        except Exception as e:
+            network_errors += 1
+            log.exception("[%s] Network sync failed: %s", network_code, e)
+
+    deleted = 0
+    if RETENTION_CLEANUP_ENABLED:
+        cutoff = get_date_days_ago(RETENTION_DAYS)
+        deleted = cleanup_old_data(cutoff)
+    else:
+        log.info("Retention cleanup disabled (RETENTION_CLEANUP_ENABLED=false)")
 
     elapsed = round(time.time() - start_time, 1)
     stats = {
         "status": "completed",
         "range": f"{start_date}..{end_date}",
-        "inventory_units": len(inventory),
-        "report_rows": len(rows),
+        "networks": len(grouped),
+        "network_errors": network_errors,
+        "inventory_units": total_inventory_units,
+        "report_rows": total_report_rows,
         "rows_written": written,
         "rows_deleted": deleted,
         "elapsed_seconds": elapsed,
@@ -967,7 +1119,13 @@ def main():
 
     log.info("=" * 60)
     log.info("Mi Reporting Bot starting")
-    log.info("Interval: %d min | Lookback: %d days | Retention: %d days", SYNC_INTERVAL, LOOKBACK_DAYS, RETENTION_DAYS)
+    log.info(
+        "Interval: %d min | Lookback: %d days | Retention: %d days | Retention cleanup: %s",
+        SYNC_INTERVAL,
+        LOOKBACK_DAYS,
+        RETENTION_DAYS,
+        "on" if RETENTION_CLEANUP_ENABLED else "off",
+    )
     log.info("GAM network: %s | OLD DB: %s | NEW DB: %s", GAM_NETWORK_CODE, OLD_SUPABASE_URL, SUPABASE_URL)
     log.info("=" * 60)
 
